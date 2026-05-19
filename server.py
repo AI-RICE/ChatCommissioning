@@ -46,6 +46,12 @@ _i_q_ref: float = 0.0
 _T_load: float = 0.0
 _history: list[dict] = []
 
+# Outer speed-loop PI gains (used by run_load_profile when speed control is active).
+# Stored here so set_controller_weights can update them and get_controller_config
+# can report them; run_load_profile reads from these unless overridden.
+_speed_kp: float = 5.0    # [A/(rad/s)]
+_speed_ki: float = 100.0  # [A/rad]
+
 
 def _state_dict(state, action=None) -> dict:
     """Convert DriveState (+ optional ControlAction) to a JSON-safe dict."""
@@ -265,35 +271,41 @@ def set_motor_parameters(
     B: float | None = None,
     i_max: float | None = None,
     v_dc: float | None = None,
+    k_sat_d: float | None = None,
+    k_sat_q: float | None = None,
 ) -> dict:
     """
     Update motor parameters. Only supplied fields are changed.
     Resets the simulator and controller after any change.
 
     Args:
-        R_s:   Stator resistance [Ω]
-        L_d:   d-axis inductance [H] — must satisfy L_d < L_q for IPMSM
-        L_q:   q-axis inductance [H]
-        psi_f: PM flux linkage [Wb]
-        p:     Pole pairs (integer)
-        J:     Rotor inertia [kg·m²]
-        B:     Viscous friction [N·m·s/rad]
-        i_max: Peak current limit [A]
-        v_dc:  DC bus voltage [V]
+        R_s:     Stator resistance [Ω]
+        L_d:     d-axis inductance [H] — must satisfy L_d < L_q for IPMSM
+        L_q:     q-axis inductance [H]
+        psi_f:   PM flux linkage [Wb]
+        p:       Pole pairs (integer)
+        J:       Rotor inertia [kg·m²]
+        B:       Viscous friction [N·m·s/rad]
+        i_max:   Peak current limit [A]
+        v_dc:    DC bus voltage [V]
+        k_sat_d: d-axis saturation coefficient (0 = linear)
+        k_sat_q: q-axis saturation coefficient (0 = linear; cross-coupled with i_d)
     """
     global _motor_params, _sim, _ctrl, _history
 
     prev = _motor_params
     updated = IPMSMParameters(
-        R_s=R_s       if R_s    is not None else prev.R_s,
-        L_d=L_d       if L_d    is not None else prev.L_d,
-        L_q=L_q       if L_q    is not None else prev.L_q,
-        psi_f=psi_f   if psi_f  is not None else prev.psi_f,
-        p=p           if p      is not None else prev.p,
-        J=J           if J      is not None else prev.J,
-        B=B           if B      is not None else prev.B,
-        i_max=i_max   if i_max  is not None else prev.i_max,
-        v_dc=v_dc     if v_dc   is not None else prev.v_dc,
+        R_s=R_s         if R_s     is not None else prev.R_s,
+        L_d=L_d         if L_d     is not None else prev.L_d,
+        L_q=L_q         if L_q     is not None else prev.L_q,
+        psi_f=psi_f     if psi_f   is not None else prev.psi_f,
+        p=p             if p       is not None else prev.p,
+        J=J             if J       is not None else prev.J,
+        B=B             if B       is not None else prev.B,
+        i_max=i_max     if i_max   is not None else prev.i_max,
+        v_dc=v_dc       if v_dc    is not None else prev.v_dc,
+        k_sat_d=k_sat_d if k_sat_d is not None else prev.k_sat_d,
+        k_sat_q=k_sat_q if k_sat_q is not None else prev.k_sat_q,
         dt=prev.dt,
     )
     if updated.L_d >= updated.L_q:
@@ -427,15 +439,22 @@ def set_field_weakening_reference(omega_r_rads: float, i_mag: float) -> dict:
 
 @mcp.tool()
 def get_controller_config() -> dict:
-    """Return current FCS-MPC cost weights, horizon, and current reference."""
+    """Return current FCS-MPC cost weights and horizon, outer speed-loop PI gains,
+    and the active current reference."""
     return {
         "config": _ctrl_params.describe(),
+        "speed_pi": {
+            "kp_A_per_rad_s": _speed_kp,
+            "ki_A_per_rad":   _speed_ki,
+        },
         "reference": {"i_d_ref_A": _i_d_ref, "i_q_ref_A": _i_q_ref},
         "context": (
-            "Cost weights determine the controller trade-offs. "
+            "Cost weights determine the inner FCS-MPC trade-offs. "
             "weight_switching > 0 reduces switching frequency at cost of higher ripple. "
             "weight_torque_ripple > 0 smooths torque, useful at low speed. "
-            "horizon > 1 reduces steady-state ripple but evaluates more candidates."
+            "horizon > 1 reduces steady-state ripple but evaluates more candidates. "
+            "Outer speed PI gains apply when run_load_profile is invoked with a "
+            "speed reference; tune via this tool, not via run_load_profile args."
         ),
     }
 
@@ -448,25 +467,32 @@ def set_controller_weights(
     torque_ripple: float | None = None,
     common_mode: float | None = None,
     horizon: int | None = None,
+    speed_kp: float | None = None,
+    speed_ki: float | None = None,
 ) -> dict:
     """
-    Update FCS-MPC cost function weights and/or prediction horizon.
-    Only supplied fields are changed. All weights must be ≥ 0.
+    Update FCS-MPC cost function weights, prediction horizon, and/or outer
+    speed-loop PI gains. Only supplied fields are changed; all weights must
+    be ≥ 0.
 
     Args:
-        id_error:      d-axis current tracking weight
-        iq_error:      q-axis current tracking weight
+        id_error:      d-axis current tracking weight (FCS-MPC)
+        iq_error:      q-axis current tracking weight (FCS-MPC)
         switching:     switching transition penalty — raise to reduce switching frequency
         torque_ripple: torque ripple penalty — raise for smoother torque at low speed
         common_mode:   common-mode voltage penalty — raise to reduce EMI
-        horizon:       prediction horizon steps (1, 2, or 3)
+        horizon:       FCS-MPC prediction horizon (1, 2, or 3)
+        speed_kp:      outer speed-loop PI proportional gain [A/(rad/s)]
+        speed_ki:      outer speed-loop PI integral gain     [A/rad]
 
     Trade-offs:
-        switching ↑  → fewer transitions, lower losses, but higher current ripple
+        switching ↑     → fewer transitions, lower losses, but higher current ripple
         torque_ripple ↑ → smoother torque, may conflict with fast current tracking
-        horizon ↑    → less ripple, more candidates evaluated (8^horizon per step)
+        horizon ↑       → less ripple, more candidates evaluated (8^horizon per step)
+        speed_kp ↑      → faster speed tracking, more overshoot
+        speed_ki ↑      → faster zero steady-state error, more overshoot
     """
-    global _ctrl_params, _ctrl
+    global _ctrl_params, _ctrl, _speed_kp, _speed_ki
     prev = _ctrl_params
     w = prev.weights
 
@@ -490,14 +516,25 @@ def set_controller_weights(
     _ctrl = FCSMPCController(_motor_params, _ctrl_params)
     _ctrl.set_reference(_i_d_ref, _i_q_ref)
 
+    if speed_kp is not None:
+        if speed_kp < 0:
+            return {"status": "error", "context": "speed_kp must be ≥ 0."}
+        _speed_kp = speed_kp
+    if speed_ki is not None:
+        if speed_ki < 0:
+            return {"status": "error", "context": "speed_ki must be ≥ 0."}
+        _speed_ki = speed_ki
+
     return {
         "status": "ok",
         "config": _ctrl_params.describe(),
+        "speed_pi": {"kp_A_per_rad_s": _speed_kp, "ki_A_per_rad": _speed_ki},
         "context": (
             f"Controller updated. horizon={new_horizon}, "
             f"λ_sw={new_weights.switching}, λ_tr={new_weights.torque_ripple}, "
-            f"λ_cm={new_weights.common_mode}. "
-            f"Run a scenario to observe the effect on ripple and switching frequency."
+            f"λ_cm={new_weights.common_mode}, "
+            f"speed_kp={_speed_kp}, speed_ki={_speed_ki}. "
+            f"Run a scenario to observe the effect."
         ),
     }
 
@@ -537,6 +574,7 @@ def set_load_torque(T_load_Nm: float) -> dict:
 def run_scenario(
     duration_s: float,
     record_every: int = 10,
+    reset_first: bool = False,
 ) -> dict:
     """
     Run the simulator for a given duration with the current reference and load torque.
@@ -546,11 +584,19 @@ def run_scenario(
         duration_s:   Simulation duration [s]
         record_every: Record one sample every N steps (reduces output size).
                       Default 10 → 1 kHz effective sample rate at dt=100µs.
+        reset_first:  If True, reset the simulator and controller to standstill
+                      before running. Use for clean verification reads after a
+                      tuning sweep that may have warmed the simulator state.
 
     Returns drive state history and commissioning metrics (rise time, overshoot,
     settling time, ripple, average switching frequency).
     """
     global _history
+
+    if reset_first:
+        _sim.reset()
+        _ctrl.reset()
+        _history = []
 
     n_steps = int(duration_s / _motor_params.dt)
     if n_steps > 500_000:
@@ -663,8 +709,8 @@ def compute_operating_point(i_mag: float, omega_r_rads: float = 0.0) -> dict:
 def run_load_profile(
     profile: list[list[float]],
     speed_reference_rpm: float | None = None,
-    speed_kp: float = 5.0,
-    speed_ki: float = 100.0,
+    speed_kp: float | None = None,
+    speed_ki: float | None = None,
     record_every: int = 5,
 ) -> dict:
     """
@@ -688,8 +734,12 @@ def run_load_profile(
                               for a 3 N·m load step from t=0.1 s to t=0.4 s.
         speed_reference_rpm:  Target speed for outer PI loop [RPM]. If None,
                               uses current FCS-MPC reference (torque control).
-        speed_kp:             Speed PI proportional gain [A/(rad/s)]
-        speed_ki:             Speed PI integral gain [A/(rad/s·s)]
+        speed_kp:             Override speed PI proportional gain [A/(rad/s)].
+                              If None, uses the value set via
+                              set_controller_weights (default 5.0).
+        speed_ki:             Override speed PI integral gain [A/rad].
+                              If None, uses the value set via
+                              set_controller_weights (default 100.0).
         record_every:         Record every N-th step to limit output size.
 
     Statistics returned:
@@ -697,6 +747,10 @@ def run_load_profile(
       switching frequency.
     """
     p = _motor_params
+
+    # Resolve speed-loop gains: explicit args override module-level state.
+    eff_speed_kp = speed_kp if speed_kp is not None else _speed_kp
+    eff_speed_ki = speed_ki if speed_ki is not None else _speed_ki
 
     # --- Validate profile ---
     if len(profile) < 2:
@@ -740,7 +794,7 @@ def run_load_profile(
         if speed_mode:
             err_spd = omega_ref - sim.state.omega_r
             int_spd += err_spd * p.dt
-            iq_cmd = float(np.clip(speed_kp * err_spd + speed_ki * int_spd,
+            iq_cmd = float(np.clip(eff_speed_kp * err_spd + eff_speed_ki * int_spd,
                                    -p.i_max, p.i_max))
             i_mag_cmd = abs(iq_cmd)
             if i_mag_cmd > 0.1:

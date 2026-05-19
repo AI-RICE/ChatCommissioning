@@ -53,7 +53,9 @@ Then follow this sequence, pausing for confirmation at each numbered step:
 
 7. **Run load profile** (optional) — ask the engineer to describe the expected
    load cycle, then call `run_load_profile`. Report mean current, peak torque,
-   and whether any limits were approached.
+   and whether any limits were approached. Outer speed-loop PI gains are set
+   via `set_controller_weights` (`speed_kp`, `speed_ki`), not as arguments to
+   `run_load_profile`.
 
 8. **Summary** — present a concise commissioning report: identified parameters,
    final controller weights, and any concerns for real-hardware deployment.
@@ -67,6 +69,13 @@ The MCP tools provide drive-specific data. You provide control theory:
   and rated torque² before comparing λ values is good practice.
 - Saturation reduces L_q at high i_q; the MTPA locus shifts and must be re-evaluated
   if the flux map shows > 15% inductance variation.
+
+## Clean verification
+
+When running a verification scenario after a tuning sweep, pass
+`reset_first=True` to `run_scenario`. The simulator's internal state persists
+across consecutive scenarios, so without a reset the verification reading
+depends on the trajectory of the tuning process, not just on the final weight.
 
 ## Safety reminders
 
