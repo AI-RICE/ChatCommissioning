@@ -4,3 +4,6 @@ __pycache__/
 *.png
 *.html
 .claude/settings.local.json
+
+# local Claude Code settings — never public
+.claude/settings.local.json

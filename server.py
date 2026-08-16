@@ -861,67 +861,19 @@ def run_load_profile(
         "switching": {"avg_freq_hz": round(f_sw_hz, 0)},
     }
 
-    # --- Plot ---
-    fig = plt.figure(figsize=(11, 8))
-    mode_label = (f"Speed ctrl  ω_ref={speed_reference_rpm:.0f} RPM" if speed_mode
-                  else "Torque ctrl  (current ref fixed)")
-    fig.suptitle(f"Load Profile Simulation — {mode_label}", fontsize=11, fontweight="bold")
-    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.48, wspace=0.35)
-    t_ms = [h["t_ms"] for h in history]
-
-    # Speed
-    ax = fig.add_subplot(gs[0, :])   # full width
-    ax.plot(t_ms, spd, color="#1f77b4", label="ω_r")
-    if speed_mode:
-        ax.axhline(speed_reference_rpm, color="red", ls="--", lw=0.9,
-                   label=f"ref {speed_reference_rpm:.0f} RPM")
-    ax.set_ylabel("Speed [RPM]"); ax.set_title("Speed"); ax.legend(fontsize=8); ax.grid(True)
-
-    # Load + electromagnetic torque
-    ax = fig.add_subplot(gs[1, 0])
-    ax.plot(t_ms, [h["T_e_Nm"]    for h in history], color="#2ca02c", label="T_e")
-    ax.plot(t_ms, [h["T_load_Nm"] for h in history], color="gray",    ls="--", lw=1.0, label="T_load")
-    ax.set_ylabel("Torque [N·m]"); ax.set_title("Torque"); ax.legend(fontsize=8); ax.grid(True)
-
-    # dq currents
-    ax = fig.add_subplot(gs[1, 1])
-    ax.plot(t_ms, [h["i_d_A"] for h in history], label="i_d")
-    ax.plot(t_ms, [h["i_q_A"] for h in history], label="i_q")
-    ax.set_ylabel("Current [A]"); ax.set_title("dq currents"); ax.legend(fontsize=8); ax.grid(True)
-
-    # Current magnitude (thermal)
-    ax = fig.add_subplot(gs[2, 0])
-    ax.plot(t_ms, [h["i_mag_A"] for h in history], color="#d62728")
-    ax.axhline(i_rms, color="gray", ls="--", lw=0.9, label=f"RMS {i_rms:.2f} A")
-    ax.axhline(p.i_max, color="black", ls=":", lw=0.8, label=f"i_max {p.i_max} A")
-    ax.set_ylabel("|i| [A]"); ax.set_xlabel("Time [ms]")
-    ax.set_title("Current magnitude (thermal load)"); ax.legend(fontsize=8); ax.grid(True)
-
-    # Stats summary text
-    ax = fig.add_subplot(gs[2, 1])
-    ax.axis("off")
-    lines = [
-        f"Speed:  {speed_stats['mean_rpm']:.0f} ± {speed_stats['std_rpm']:.1f} RPM",
-    ]
-    if speed_mode:
-        lines.append(f"Max deviation:  {speed_stats.get('max_deviation_rpm','—')} RPM  "
-                     f"({speed_stats.get('regulation_pct','—')} %)")
-    lines += [
-        f"",
-        f"T_e:  mean {stats['torque']['mean_Nm']} N·m,  peak {stats['torque']['peak_Nm']} N·m",
-        f"i RMS:  {stats['current']['rms_A']} A,  peak {stats['current']['peak_A']} A",
-        f"",
-        f"Mech. power:  {stats['power']['mech_mean_W']:.0f} W",
-        f"Copper loss:  {stats['power']['copper_loss_W']:.1f} W",
-        f"η proxy:  {stats['power']['efficiency_proxy_pct']:.1f} %",
-        f"",
-        f"Avg switch freq:  {stats['switching']['avg_freq_hz']:.0f} Hz",
-    ]
-    ax.text(0.05, 0.95, "\n".join(lines), transform=ax.transAxes,
-            fontsize=8, va="top", fontfamily="monospace",
-            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
-
-    img = _fig_to_image(fig, dpi=120)
+    # --- Stash recorded data for plot_load_profile (return data, not an image:
+    # a FastMCP Image nested inside a returned dict is serialised to its repr
+    # and never reaches the client — see plot_load_profile for the renderer). ---
+    global _load_profile
+    _load_profile = {
+        "history":             history,
+        "i_rms":               i_rms,
+        "speed_mode":          speed_mode,
+        "speed_reference_rpm": speed_reference_rpm,
+        "i_max":               p.i_max,
+        "speed_stats":         speed_stats,
+        "stats":               stats,
+    }
 
     summary = (
         f"Load profile complete ({duration_s*1e3:.0f} ms, {len(history)} samples). "
@@ -934,7 +886,8 @@ def run_load_profile(
         + f"Switching {stats['switching']['avg_freq_hz']:.0f} Hz."
     )
 
-    return {"status": "ok", "statistics": stats, "context": summary, "plot": img}
+    return {"status": "ok", "statistics": stats, "context": summary,
+            "hint": "Call plot_load_profile() to visualise this run."}
 
 
 # ---------------------------------------------------------------------------
@@ -942,6 +895,7 @@ def run_load_profile(
 # ---------------------------------------------------------------------------
 
 _flux_map: dict | None = None   # set by sweep_flux_linkage_map, read by plot_flux_linkage_map
+_load_profile: dict | None = None   # set by run_load_profile, read by plot_load_profile
 
 
 class _PICtrl:
@@ -1181,6 +1135,88 @@ def plot_flux_linkage_map() -> Image:
                             ha="center", va="center", fontsize=6, color="black")
 
     plt.tight_layout()
+    return _fig_to_image(fig, dpi=120)
+
+
+@mcp.tool()
+def plot_load_profile() -> Image:
+    """
+    Render the speed / torque / current plot for the last run_load_profile call.
+    Returns the figure as an inline image. Call after run_load_profile().
+    """
+    if _load_profile is None:
+        raise ValueError("No load profile available. Run run_load_profile() first.")
+
+    lp          = _load_profile
+    history     = lp["history"]
+    i_rms       = lp["i_rms"]
+    speed_mode  = lp["speed_mode"]
+    speed_reference_rpm = lp["speed_reference_rpm"]
+    i_max       = lp["i_max"]
+    speed_stats = lp["speed_stats"]
+    stats       = lp["stats"]
+
+    spd  = np.array([h["speed_rpm"] for h in history])
+    t_ms = [h["t_ms"] for h in history]
+
+    fig = plt.figure(figsize=(11, 8))
+    mode_label = (f"Speed ctrl  ω_ref={speed_reference_rpm:.0f} RPM" if speed_mode
+                  else "Torque ctrl  (current ref fixed)")
+    fig.suptitle(f"Load Profile Simulation — {mode_label}", fontsize=11, fontweight="bold")
+    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.48, wspace=0.35)
+
+    # Speed
+    ax = fig.add_subplot(gs[0, :])   # full width
+    ax.plot(t_ms, spd, color="#1f77b4", label="ω_r")
+    if speed_mode:
+        ax.axhline(speed_reference_rpm, color="red", ls="--", lw=0.9,
+                   label=f"ref {speed_reference_rpm:.0f} RPM")
+    ax.set_ylabel("Speed [RPM]"); ax.set_title("Speed"); ax.legend(fontsize=8); ax.grid(True)
+
+    # Load + electromagnetic torque
+    ax = fig.add_subplot(gs[1, 0])
+    ax.plot(t_ms, [h["T_e_Nm"]    for h in history], color="#2ca02c", label="T_e")
+    ax.plot(t_ms, [h["T_load_Nm"] for h in history], color="gray",    ls="--", lw=1.0, label="T_load")
+    ax.set_ylabel("Torque [N·m]"); ax.set_title("Torque"); ax.legend(fontsize=8); ax.grid(True)
+
+    # dq currents
+    ax = fig.add_subplot(gs[1, 1])
+    ax.plot(t_ms, [h["i_d_A"] for h in history], label="i_d")
+    ax.plot(t_ms, [h["i_q_A"] for h in history], label="i_q")
+    ax.set_ylabel("Current [A]"); ax.set_title("dq currents"); ax.legend(fontsize=8); ax.grid(True)
+
+    # Current magnitude (thermal)
+    ax = fig.add_subplot(gs[2, 0])
+    ax.plot(t_ms, [h["i_mag_A"] for h in history], color="#d62728")
+    ax.axhline(i_rms, color="gray", ls="--", lw=0.9, label=f"RMS {i_rms:.2f} A")
+    ax.axhline(i_max, color="black", ls=":", lw=0.8, label=f"i_max {i_max} A")
+    ax.set_ylabel("|i| [A]"); ax.set_xlabel("Time [ms]")
+    ax.set_title("Current magnitude (thermal load)"); ax.legend(fontsize=8); ax.grid(True)
+
+    # Stats summary text
+    ax = fig.add_subplot(gs[2, 1])
+    ax.axis("off")
+    lines = [
+        f"Speed:  {speed_stats['mean_rpm']:.0f} ± {speed_stats['std_rpm']:.1f} RPM",
+    ]
+    if speed_mode:
+        lines.append(f"Max deviation:  {speed_stats.get('max_deviation_rpm','—')} RPM  "
+                     f"({speed_stats.get('regulation_pct','—')} %)")
+    lines += [
+        f"",
+        f"T_e:  mean {stats['torque']['mean_Nm']} N·m,  peak {stats['torque']['peak_Nm']} N·m",
+        f"i RMS:  {stats['current']['rms_A']} A,  peak {stats['current']['peak_A']} A",
+        f"",
+        f"Mech. power:  {stats['power']['mech_mean_W']:.0f} W",
+        f"Copper loss:  {stats['power']['copper_loss_W']:.1f} W",
+        f"η proxy:  {stats['power']['efficiency_proxy_pct']:.1f} %",
+        f"",
+        f"Avg switch freq:  {stats['switching']['avg_freq_hz']:.0f} Hz",
+    ]
+    ax.text(0.05, 0.95, "\n".join(lines), transform=ax.transAxes,
+            fontsize=8, va="top", fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
+
     return _fig_to_image(fig, dpi=120)
 
 
